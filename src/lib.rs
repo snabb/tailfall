@@ -4,14 +4,16 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use globset::{GlobBuilder, GlobMatcher};
-use notify::{RecursiveMode, Watcher};
+use notify::{EventKind, RecursiveMode, Watcher};
 use same_file::Handle;
 
 const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(1);
+const EVENT_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(250);
 const READ_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,45 +167,57 @@ struct FileState {
 
 pub fn run(operand: Option<&OsStr>, output_mode: OutputMode) -> Result<(), Error> {
     let spec = WatchSpec::from_operand(operand)?;
-    let (sender, receiver) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(sender)?;
+    let changed = Arc::new(AtomicBool::new(false));
+    let callback_changed = Arc::clone(&changed);
+    let mut watcher =
+        notify::recommended_watcher(move |result: Result<notify::Event, notify::Error>| {
+            let should_reconcile = match result {
+                // Reconciliation opens every tracked file.  Reacting to those access events
+                // would make the watcher trigger itself indefinitely.
+                Ok(event) => !matches!(event.kind, EventKind::Access(_)),
+                Err(error) => {
+                    eprintln!("tailfany: watcher error: {error}");
+                    true
+                }
+            };
+            if should_reconcile {
+                callback_changed.store(true, Ordering::Release);
+            }
+        })?;
     watcher.watch(spec.root(), spec.recursive_mode())?;
 
     let stdout = io::stdout();
     let writer = BufWriter::new(stdout.lock());
     let mut engine = TailEngine::new(spec, output_mode, writer);
     engine.initialize()?;
+    let mut next_reconcile = std::time::Instant::now() + RECONCILIATION_INTERVAL;
 
     loop {
-        match receiver.recv_timeout(RECONCILIATION_INTERVAL) {
-            Ok(Ok(_event)) => {
-                while receiver.try_recv().is_ok() {}
-                if !reconcile_or_exit(&mut engine)? {
-                    return Ok(());
-                }
+        let now = std::time::Instant::now();
+        let wait = next_reconcile
+            .saturating_duration_since(now)
+            .min(EVENT_RECONCILIATION_INTERVAL);
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
+
+        let event_pending = changed.swap(false, Ordering::Acquire);
+        if event_pending || std::time::Instant::now() >= next_reconcile {
+            if !reconcile_result_or_exit(engine.reconcile())? {
+                return Ok(());
             }
-            Ok(Err(error)) => {
-                eprintln!("tailfany: watcher error: {error}");
-                if !reconcile_or_exit(&mut engine)? {
-                    return Ok(());
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                if !reconcile_or_exit(&mut engine)? {
-                    return Ok(());
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(Error::InvalidOperand(
-                    "the filesystem watcher stopped unexpectedly".to_owned(),
-                ));
-            }
+            next_reconcile = std::time::Instant::now()
+                + if event_pending {
+                    EVENT_RECONCILIATION_INTERVAL
+                } else {
+                    RECONCILIATION_INTERVAL
+                };
         }
     }
 }
 
-fn reconcile_or_exit<W: Write>(engine: &mut TailEngine<W>) -> Result<bool, Error> {
-    match engine.reconcile() {
+fn reconcile_result_or_exit(result: Result<(), Error>) -> Result<bool, Error> {
+    match result {
         Err(Error::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe => Ok(false),
         result => result.map(|()| true),
     }
