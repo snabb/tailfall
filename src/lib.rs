@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use globset::{GlobBuilder, GlobMatcher};
-use notify::{EventKind, RecursiveMode, Watcher};
+use notify::{
+    EventKind, RecursiveMode, Watcher,
+    event::{CreateKind, ModifyKind, RemoveKind},
+};
 use same_file::Handle;
 
 const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(1);
@@ -167,14 +170,13 @@ struct FileState {
 
 pub fn run(operand: Option<&OsStr>, output_mode: OutputMode) -> Result<(), Error> {
     let spec = WatchSpec::from_operand(operand)?;
+    let recursive = matches!(spec.recursive_mode(), RecursiveMode::Recursive);
     let changed = Arc::new(AtomicBool::new(false));
     let callback_changed = Arc::clone(&changed);
     let mut watcher =
         notify::recommended_watcher(move |result: Result<notify::Event, notify::Error>| {
             let should_reconcile = match result {
-                // Reconciliation opens every tracked file.  Reacting to those access events
-                // would make the watcher trigger itself indefinitely.
-                Ok(event) => !matches!(event.kind, EventKind::Access(_)),
+                Ok(event) => event_requires_reconciliation(&event, recursive),
                 Err(error) => {
                     eprintln!("tailfany: watcher error: {error}");
                     true
@@ -213,6 +215,19 @@ pub fn run(operand: Option<&OsStr>, output_mode: OutputMode) -> Result<(), Error
                     RECONCILIATION_INTERVAL
                 };
         }
+    }
+}
+
+fn event_requires_reconciliation(event: &notify::Event, recursive: bool) -> bool {
+    match event.kind {
+        // Reconciliation opens every tracked file.  Reacting to access events would make the
+        // watcher trigger itself indefinitely.
+        EventKind::Access(_) => false,
+        // Metadata changes do not affect either the file contents or its matching path.
+        EventKind::Modify(ModifyKind::Metadata(_)) => false,
+        // A non-recursive watch cannot discover matching files inside a new directory.
+        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder) => recursive,
+        _ => true,
     }
 }
 
@@ -417,6 +432,48 @@ mod tests {
 
     fn output(engine: &TailEngine<Vec<u8>>) -> String {
         String::from_utf8(engine.writer.clone()).expect("UTF-8 test output")
+    }
+
+    #[test]
+    fn irrelevant_watcher_events_are_filtered() {
+        assert!(!event_requires_reconciliation(
+            &notify::Event::new(EventKind::Access(notify::event::AccessKind::Read)),
+            false,
+        ));
+        assert!(!event_requires_reconciliation(
+            &notify::Event::new(EventKind::Modify(ModifyKind::Metadata(
+                notify::event::MetadataKind::Any,
+            ))),
+            false,
+        ));
+        assert!(!event_requires_reconciliation(
+            &notify::Event::new(EventKind::Create(CreateKind::Folder)),
+            false,
+        ));
+        assert!(!event_requires_reconciliation(
+            &notify::Event::new(EventKind::Remove(RemoveKind::Folder)),
+            false,
+        ));
+        assert!(event_requires_reconciliation(
+            &notify::Event::new(EventKind::Create(CreateKind::Folder)),
+            true,
+        ));
+        assert!(event_requires_reconciliation(
+            &notify::Event::new(EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Any,
+            ))),
+            false,
+        ));
+        assert!(event_requires_reconciliation(
+            &notify::Event::new(EventKind::Modify(ModifyKind::Name(
+                notify::event::RenameMode::Any,
+            ))),
+            false,
+        ));
+        assert!(event_requires_reconciliation(
+            &notify::Event::new(EventKind::Other),
+            false,
+        ));
     }
 
     #[test]
