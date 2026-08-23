@@ -213,6 +213,7 @@ struct TailEngine<W> {
     spec: WatchSpec,
     output_mode: OutputMode,
     files: BTreeMap<PathBuf, FileState>,
+    last_output_path: Option<PathBuf>,
     writer: W,
 }
 
@@ -222,6 +223,7 @@ impl<W: Write> TailEngine<W> {
             spec,
             output_mode,
             files: BTreeMap::new(),
+            last_output_path: None,
             writer,
         }
     }
@@ -241,9 +243,13 @@ impl<W: Write> TailEngine<W> {
 
         for path in paths {
             let previous = self.files.get(&path);
-            if let Some(state) =
-                Self::read_new_data(&mut self.writer, self.output_mode, &path, previous)?
-            {
+            if let Some(state) = Self::read_new_data(
+                &mut self.writer,
+                self.output_mode,
+                &mut self.last_output_path,
+                &path,
+                previous,
+            )? {
                 self.files.insert(path, state);
             }
         }
@@ -269,6 +275,7 @@ impl<W: Write> TailEngine<W> {
     fn read_new_data(
         writer: &mut W,
         output_mode: OutputMode,
+        last_output_path: &mut Option<PathBuf>,
         path: &Path,
         previous: Option<&FileState>,
     ) -> Result<Option<FileState>, Error> {
@@ -290,15 +297,14 @@ impl<W: Write> TailEngine<W> {
 
         file.seek(SeekFrom::Start(offset))?;
         let mut buffer = [0_u8; READ_BUFFER_SIZE];
-        let mut wrote_header = false;
         loop {
             let read = file.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
-            if !wrote_header && output_mode == OutputMode::Headers {
+            if output_mode == OutputMode::Headers && last_output_path.as_deref() != Some(path) {
                 writeln!(writer, "==> {} <==", path.display())?;
-                wrote_header = true;
+                *last_output_path = Some(path.to_path_buf());
             }
             writer.write_all(&buffer[..read])?;
             offset += read as u64;
@@ -445,6 +451,52 @@ mod tests {
 
         assert!(output(&engine).contains("==> "));
         assert!(output(&engine).ends_with("new"));
+    }
+
+    #[test]
+    fn headers_are_repeated_only_when_output_switches_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.log");
+        let second = temp.path().join("second.log");
+        fs::write(&first, b"old").unwrap();
+        fs::write(&second, b"old").unwrap();
+        let spec = WatchSpec::from_operand(Some(temp.path().as_os_str())).unwrap();
+        let mut engine = TailEngine::new(spec, OutputMode::Headers, Vec::new());
+        engine.initialize().unwrap();
+
+        OpenOptions::new()
+            .append(true)
+            .open(&first)
+            .unwrap()
+            .write_all(b"first\n")
+            .unwrap();
+        engine.reconcile().unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&first)
+            .unwrap()
+            .write_all(b"second\n")
+            .unwrap();
+        engine.reconcile().unwrap();
+        assert_eq!(output(&engine).matches("==> ").count(), 1);
+
+        OpenOptions::new()
+            .append(true)
+            .open(&second)
+            .unwrap()
+            .write_all(b"other\n")
+            .unwrap();
+        engine.reconcile().unwrap();
+        assert_eq!(output(&engine).matches("==> ").count(), 2);
+
+        OpenOptions::new()
+            .append(true)
+            .open(&first)
+            .unwrap()
+            .write_all(b"third\n")
+            .unwrap();
+        engine.reconcile().unwrap();
+        assert_eq!(output(&engine).matches("==> ").count(), 3);
     }
 
     #[test]
