@@ -178,7 +178,7 @@ pub fn run(operand: Option<&OsStr>, output_mode: OutputMode) -> Result<(), Error
             let should_reconcile = match result {
                 Ok(event) => event_requires_reconciliation(&event, recursive),
                 Err(error) => {
-                    eprintln!("tailfany: watcher error: {error}");
+                    eprintln!("tailfall: watcher error: {error}");
                     true
                 }
             };
@@ -292,7 +292,7 @@ impl<W: Write> TailEngine<W> {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                eprintln!("tailfany: cannot open {}: {error}", path.display());
+                eprintln!("tailfall: cannot open {}: {error}", path.display());
                 return Ok(None);
             }
         };
@@ -312,7 +312,7 @@ impl<W: Write> TailEngine<W> {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                eprintln!("tailfany: cannot open {}: {error}", path.display());
+                eprintln!("tailfall: cannot open {}: {error}", path.display());
                 return Ok(None);
             }
         };

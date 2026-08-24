@@ -8,13 +8,13 @@ use std::time::{Duration, Instant};
 #[test]
 fn native_watcher_follows_a_file_created_after_startup() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tailfany"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tailfall"))
         .arg("--no-headers")
         .arg(directory.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("start tailfany");
+        .expect("start tailfall");
     let mut stdout = child.stdout.take().expect("child stdout");
     let (sender, receiver) = mpsc::channel();
     let reader = thread::spawn(move || {
@@ -45,8 +45,8 @@ fn native_watcher_follows_a_file_created_after_startup() {
         }
     }
 
-    child.kill().expect("stop tailfany");
-    child.wait().expect("wait for tailfany");
+    child.kill().expect("stop tailfall");
+    child.wait().expect("wait for tailfall");
     reader.join().expect("join stdout reader");
 
     assert_eq!(output, b"created data\n");

@@ -4,7 +4,7 @@ use clap::Parser;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "tailfany",
+    name = "tailfall",
     version,
     about = "Follow new data in matching files, including files created later"
 )]
@@ -21,13 +21,13 @@ struct Args {
 fn main() {
     let args = Args::parse();
     let mode = if args.no_headers {
-        tailfany::OutputMode::Raw
+        tailfall::OutputMode::Raw
     } else {
-        tailfany::OutputMode::Headers
+        tailfall::OutputMode::Headers
     };
 
-    if let Err(error) = tailfany::run(args.operand.as_deref(), mode) {
-        eprintln!("tailfany: {error}");
+    if let Err(error) = tailfall::run(args.operand.as_deref(), mode) {
+        eprintln!("tailfall: {error}");
         std::process::exit(1);
     }
 }

@@ -1,5 +1,5 @@
 [package]
-name = "tailfany"
+name = "tailfall"
 version = "0.1.0"
 edition = "2024"
 description = "Follow new data in all matching files, including files created later"

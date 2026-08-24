@@ -1,17 +1,17 @@
-# tailfany
+# tailfall
 
-`tailfany` follows new data in all matching files, including files that
+`tailfall` follows new data in all matching files, including files that
 appear after the command starts. It is useful for watching a directory where
 log files are created or rotated over time.
 
 ```sh
-tailfany '*.log'
-tailfany 'logs/*.log'
-tailfany .
-tailfany
+tailfall '*.log'
+tailfall 'logs/*.log'
+tailfall .
+tailfall
 ```
 
-Quote glob patterns so the shell does not expand them before `tailfany` sees
+Quote glob patterns so the shell does not expand them before `tailfall` sees
 them.
 
 Files that exist during the initial scan start at their current end. A file
