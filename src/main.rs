@@ -16,6 +16,10 @@ struct Args {
     /// Do not print a filename header before output from each file.
     #[arg(long)]
     no_headers: bool,
+
+    /// Report files and directories that cannot be inspected or read.
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 fn main() {
@@ -26,7 +30,7 @@ fn main() {
         tailfall::OutputMode::Headers
     };
 
-    if let Err(error) = tailfall::run(args.operand.as_deref(), mode) {
+    if let Err(error) = tailfall::run(args.operand.as_deref(), mode, args.verbose) {
         eprintln!("tailfall: {error}");
         std::process::exit(1);
     }

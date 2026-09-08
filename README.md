@@ -28,6 +28,8 @@ new log data
 ```
 
 Use `--no-headers` when the output is being consumed as a raw byte stream.
+Unreadable files and directories are skipped silently; use `--verbose` to
+report filesystem errors while continuing to follow the other matches.
 Stop the command with Ctrl-C.
 
 ## Installation

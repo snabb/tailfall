@@ -147,15 +147,17 @@ impl WatchSpec {
         }
     }
 
-    fn matching_paths(&self) -> Result<Vec<PathBuf>, Error> {
+    fn matching_paths(&self, verbose: bool) -> Result<Vec<PathBuf>, Error> {
         let mut paths = Vec::new();
         match self {
-            Self::Directory { root } => collect_paths(root, root, false, None, &mut paths)?,
+            Self::Directory { root } => {
+                collect_paths(root, root, false, None, &mut paths, verbose)?
+            }
             Self::Glob {
                 root,
                 matcher,
                 recursive,
-            } => collect_paths(root, root, *recursive, Some(matcher), &mut paths)?,
+            } => collect_paths(root, root, *recursive, Some(matcher), &mut paths, verbose)?,
         }
         paths.sort();
         Ok(paths)
@@ -168,17 +170,20 @@ struct FileState {
     offset: u64,
 }
 
-pub fn run(operand: Option<&OsStr>, output_mode: OutputMode) -> Result<(), Error> {
+pub fn run(operand: Option<&OsStr>, output_mode: OutputMode, verbose: bool) -> Result<(), Error> {
     let spec = WatchSpec::from_operand(operand)?;
     let recursive = matches!(spec.recursive_mode(), RecursiveMode::Recursive);
     let changed = Arc::new(AtomicBool::new(false));
     let callback_changed = Arc::clone(&changed);
+    let callback_verbose = verbose;
     let mut watcher =
         notify::recommended_watcher(move |result: Result<notify::Event, notify::Error>| {
             let should_reconcile = match result {
                 Ok(event) => event_requires_reconciliation(&event, recursive),
                 Err(error) => {
-                    eprintln!("tailfall: watcher error: {error}");
+                    if callback_verbose {
+                        eprintln!("tailfall: watcher error: {error}");
+                    }
                     true
                 }
             };
@@ -186,11 +191,15 @@ pub fn run(operand: Option<&OsStr>, output_mode: OutputMode) -> Result<(), Error
                 callback_changed.store(true, Ordering::Release);
             }
         })?;
-    watcher.watch(spec.root(), spec.recursive_mode())?;
+    if let Err(error) = watcher.watch(spec.root(), spec.recursive_mode())
+        && verbose
+    {
+        eprintln!("tailfall: watcher error: {error}");
+    }
 
     let stdout = io::stdout();
     let writer = BufWriter::new(stdout.lock());
-    let mut engine = TailEngine::new(spec, output_mode, writer);
+    let mut engine = TailEngine::new(spec, output_mode, verbose, writer);
     engine.initialize()?;
     let mut next_reconcile = std::time::Instant::now() + RECONCILIATION_INTERVAL;
 
@@ -241,16 +250,18 @@ fn reconcile_result_or_exit(result: Result<(), Error>) -> Result<bool, Error> {
 struct TailEngine<W> {
     spec: WatchSpec,
     output_mode: OutputMode,
+    verbose: bool,
     files: BTreeMap<PathBuf, FileState>,
     last_output_path: Option<PathBuf>,
     writer: W,
 }
 
 impl<W: Write> TailEngine<W> {
-    fn new(spec: WatchSpec, output_mode: OutputMode, writer: W) -> Self {
+    fn new(spec: WatchSpec, output_mode: OutputMode, verbose: bool, writer: W) -> Self {
         Self {
             spec,
             output_mode,
+            verbose,
             files: BTreeMap::new(),
             last_output_path: None,
             writer,
@@ -258,7 +269,7 @@ impl<W: Write> TailEngine<W> {
     }
 
     fn initialize(&mut self) -> Result<(), Error> {
-        for path in self.spec.matching_paths()? {
+        for path in self.spec.matching_paths(self.verbose)? {
             if let Some(state) = self.open_at_end(&path)? {
                 self.files.insert(path, state);
             }
@@ -267,7 +278,7 @@ impl<W: Write> TailEngine<W> {
     }
 
     fn reconcile(&mut self) -> Result<(), Error> {
-        let paths = self.spec.matching_paths()?;
+        let paths = self.spec.matching_paths(self.verbose)?;
         let present: BTreeSet<_> = paths.iter().cloned().collect();
 
         for path in paths {
@@ -278,6 +289,7 @@ impl<W: Write> TailEngine<W> {
                 &mut self.last_output_path,
                 &path,
                 previous,
+                self.verbose,
             )? {
                 self.files.insert(path, state);
             }
@@ -292,12 +304,26 @@ impl<W: Write> TailEngine<W> {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                eprintln!("tailfall: cannot open {}: {error}", path.display());
+                if self.verbose {
+                    eprintln!("tailfall: cannot open {}: {error}", path.display());
+                }
                 return Ok(None);
             }
         };
-        let offset = file.metadata()?.len();
-        let identity = Handle::from_file(file.try_clone()?).map_err(Error::Io)?;
+        let offset = match file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                report_file_error(self.verbose, path, "inspect", &error);
+                return Ok(None);
+            }
+        };
+        let identity = match file.try_clone().and_then(Handle::from_file) {
+            Ok(identity) => identity,
+            Err(error) => {
+                report_file_error(self.verbose, path, "inspect", &error);
+                return Ok(None);
+            }
+        };
         Ok(Some(FileState { identity, offset }))
     }
 
@@ -307,27 +333,51 @@ impl<W: Write> TailEngine<W> {
         last_output_path: &mut Option<PathBuf>,
         path: &Path,
         previous: Option<&FileState>,
+        verbose: bool,
     ) -> Result<Option<FileState>, Error> {
         let mut file = match OpenOptions::new().read(true).open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                eprintln!("tailfall: cannot open {}: {error}", path.display());
+                if verbose {
+                    eprintln!("tailfall: cannot open {}: {error}", path.display());
+                }
                 return Ok(None);
             }
         };
 
-        let length = file.metadata()?.len();
-        let identity = Handle::from_file(file.try_clone()?).map_err(Error::Io)?;
+        let length = match file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                report_file_error(verbose, path, "inspect", &error);
+                return Ok(None);
+            }
+        };
+        let identity = match file.try_clone().and_then(Handle::from_file) {
+            Ok(identity) => identity,
+            Err(error) => {
+                report_file_error(verbose, path, "inspect", &error);
+                return Ok(None);
+            }
+        };
         let mut offset = previous.map_or(0, |state| state.offset);
         if previous.is_some_and(|state| state.identity != identity) || length < offset {
             offset = 0;
         }
 
-        file.seek(SeekFrom::Start(offset))?;
+        if let Err(error) = file.seek(SeekFrom::Start(offset)) {
+            report_file_error(verbose, path, "seek", &error);
+            return Ok(None);
+        }
         let mut buffer = [0_u8; READ_BUFFER_SIZE];
         loop {
-            let read = file.read(&mut buffer)?;
+            let read = match file.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error) => {
+                    report_file_error(verbose, path, "read", &error);
+                    return Ok(None);
+                }
+            };
             if read == 0 {
                 break;
             }
@@ -349,11 +399,31 @@ fn collect_paths(
     recursive: bool,
     matcher: Option<&GlobMatcher>,
     paths: &mut Vec<PathBuf>,
+    verbose: bool,
 ) -> Result<(), Error> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            report_path_error(verbose, directory, "read directory", &error);
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                report_path_error(verbose, directory, "inspect directory entry", &error);
+                continue;
+            }
+        };
         let path = entry.path();
-        let file_type = entry.file_type()?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                report_path_error(verbose, &path, "inspect", &error);
+                continue;
+            }
+        };
         if file_type.is_file() {
             let matches = matcher
                 .map(|matcher| {
@@ -366,10 +436,22 @@ fn collect_paths(
                 paths.push(path);
             }
         } else if recursive && file_type.is_dir() {
-            collect_paths(&path, root, true, matcher, paths)?;
+            collect_paths(&path, root, true, matcher, paths, verbose)?;
         }
     }
     Ok(())
+}
+
+fn report_file_error(verbose: bool, path: &Path, operation: &str, error: &io::Error) {
+    if verbose {
+        eprintln!("tailfall: cannot {operation} {}: {error}", path.display());
+    }
+}
+
+fn report_path_error(verbose: bool, path: &Path, operation: &str, error: &io::Error) {
+    if verbose {
+        eprintln!("tailfall: cannot {operation} {}: {error}", path.display());
+    }
 }
 
 fn make_absolute(path: &Path) -> Result<PathBuf, Error> {
@@ -482,7 +564,7 @@ mod tests {
         let file = temp.path().join("application.log");
         fs::write(&file, b"old\n").unwrap();
         let spec = WatchSpec::from_operand(Some(temp.path().as_os_str())).unwrap();
-        let mut engine = TailEngine::new(spec, OutputMode::Raw, Vec::new());
+        let mut engine = TailEngine::new(spec, OutputMode::Raw, false, Vec::new());
 
         engine.initialize().unwrap();
         assert!(engine.writer.is_empty());
@@ -501,7 +583,7 @@ mod tests {
     fn new_file_is_read_from_the_beginning() {
         let temp = tempfile::tempdir().unwrap();
         let spec = WatchSpec::from_operand(Some(temp.path().as_os_str())).unwrap();
-        let mut engine = TailEngine::new(spec, OutputMode::Raw, Vec::new());
+        let mut engine = TailEngine::new(spec, OutputMode::Raw, false, Vec::new());
         engine.initialize().unwrap();
 
         fs::write(temp.path().join("new.log"), b"created\n").unwrap();
@@ -515,7 +597,7 @@ mod tests {
         let file = temp.path().join("application.log");
         fs::write(&file, b"old").unwrap();
         let spec = WatchSpec::from_operand(Some(temp.path().as_os_str())).unwrap();
-        let mut engine = TailEngine::new(spec, OutputMode::Headers, Vec::new());
+        let mut engine = TailEngine::new(spec, OutputMode::Headers, false, Vec::new());
         engine.initialize().unwrap();
         fs::write(&file, b"oldnew").unwrap();
         engine.reconcile().unwrap();
@@ -532,7 +614,7 @@ mod tests {
         fs::write(&first, b"old").unwrap();
         fs::write(&second, b"old").unwrap();
         let spec = WatchSpec::from_operand(Some(temp.path().as_os_str())).unwrap();
-        let mut engine = TailEngine::new(spec, OutputMode::Headers, Vec::new());
+        let mut engine = TailEngine::new(spec, OutputMode::Headers, false, Vec::new());
         engine.initialize().unwrap();
 
         OpenOptions::new()
@@ -576,7 +658,7 @@ mod tests {
         let file = temp.path().join("application.log");
         fs::write(&file, b"old contents").unwrap();
         let spec = WatchSpec::from_operand(Some(temp.path().as_os_str())).unwrap();
-        let mut engine = TailEngine::new(spec, OutputMode::Raw, Vec::new());
+        let mut engine = TailEngine::new(spec, OutputMode::Raw, false, Vec::new());
         engine.initialize().unwrap();
 
         fs::write(&file, b"replacement").unwrap();
@@ -590,7 +672,7 @@ mod tests {
         let file = temp.path().join("application.log");
         fs::write(&file, b"old contents").unwrap();
         let spec = WatchSpec::from_operand(Some(temp.path().as_os_str())).unwrap();
-        let mut engine = TailEngine::new(spec, OutputMode::Raw, Vec::new());
+        let mut engine = TailEngine::new(spec, OutputMode::Raw, false, Vec::new());
         engine.initialize().unwrap();
 
         fs::remove_file(&file).unwrap();
@@ -606,7 +688,7 @@ mod tests {
         fs::write(temp.path().join("two.txt"), b"two").unwrap();
         let pattern = temp.path().join("*.log");
         let spec = WatchSpec::from_operand(Some(pattern.as_os_str())).unwrap();
-        let mut engine = TailEngine::new(spec, OutputMode::Raw, Vec::new());
+        let mut engine = TailEngine::new(spec, OutputMode::Raw, false, Vec::new());
         engine.initialize().unwrap();
 
         OpenOptions::new()
@@ -634,7 +716,7 @@ mod tests {
         fs::write(&file, b"old").unwrap();
         let pattern = temp.path().join("**/*.log");
         let spec = WatchSpec::from_operand(Some(pattern.as_os_str())).unwrap();
-        let mut engine = TailEngine::new(spec, OutputMode::Raw, Vec::new());
+        let mut engine = TailEngine::new(spec, OutputMode::Raw, false, Vec::new());
         engine.initialize().unwrap();
 
         fs::write(&file, b"oldnew").unwrap();
@@ -650,11 +732,46 @@ mod tests {
         let file = nested.join("application.log");
         fs::write(&file, b"old").unwrap();
         let spec = WatchSpec::from_operand(Some(temp.path().as_os_str())).unwrap();
-        let mut engine = TailEngine::new(spec, OutputMode::Raw, Vec::new());
+        let mut engine = TailEngine::new(spec, OutputMode::Raw, false, Vec::new());
         engine.initialize().unwrap();
 
         fs::write(&file, b"oldnew").unwrap();
         engine.reconcile().unwrap();
         assert!(engine.writer.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inaccessible_recursive_directory_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let accessible = temp.path().join("accessible.log");
+        fs::write(&accessible, b"accessible").unwrap();
+        let inaccessible = temp.path().join("inaccessible");
+        fs::create_dir(&inaccessible).unwrap();
+        fs::write(inaccessible.join("hidden.log"), b"hidden").unwrap();
+
+        let mut permissions = fs::metadata(&inaccessible).unwrap().permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&inaccessible, permissions).unwrap();
+
+        let pattern = temp.path().join("**/*.log");
+        let spec = WatchSpec::from_operand(Some(pattern.as_os_str())).unwrap();
+        let paths = spec.matching_paths(false).unwrap();
+
+        // The test may run as root, in which case mode 000 is still readable.
+        if paths.iter().any(|path| path.ends_with("hidden.log")) {
+            let mut permissions = fs::metadata(&inaccessible).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&inaccessible, permissions).unwrap();
+            return;
+        }
+        assert!(paths.iter().any(|path| path.ends_with("accessible.log")));
+        assert!(!paths.iter().any(|path| path.ends_with("hidden.log")));
+
+        let mut permissions = fs::metadata(&inaccessible).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&inaccessible, permissions).unwrap();
     }
 }
