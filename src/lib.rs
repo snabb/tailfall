@@ -13,6 +13,7 @@ use notify::{
     EventKind, RecursiveMode, Watcher,
     event::{CreateKind, ModifyKind, RemoveKind},
 };
+#[cfg(not(unix))]
 use same_file::Handle;
 
 const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(1);
@@ -166,8 +167,33 @@ impl WatchSpec {
 
 #[derive(Debug)]
 struct FileState {
-    identity: Handle,
+    identity: FileIdentity,
     offset: u64,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(not(unix))]
+type FileIdentity = Handle;
+
+#[cfg(unix)]
+fn file_identity(_file: &File, metadata: &fs::Metadata) -> io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn file_identity(file: &File, _metadata: &fs::Metadata) -> io::Result<FileIdentity> {
+    file.try_clone().and_then(Handle::from_file)
 }
 
 pub fn run(operand: Option<&OsStr>, output_mode: OutputMode, verbose: bool) -> Result<(), Error> {
@@ -315,14 +341,15 @@ impl<W: Write> TailEngine<W> {
                 return Ok(None);
             }
         };
-        let offset = match file.metadata() {
-            Ok(metadata) => metadata.len(),
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
             Err(error) => {
                 report_file_error(self.verbose, path, "inspect", &error);
                 return Ok(None);
             }
         };
-        let identity = match file.try_clone().and_then(Handle::from_file) {
+        let offset = metadata.len();
+        let identity = match file_identity(&file, &metadata) {
             Ok(identity) => identity,
             Err(error) => {
                 report_file_error(self.verbose, path, "inspect", &error);
@@ -360,7 +387,7 @@ impl<W: Write> TailEngine<W> {
             }
         };
         let length = metadata.len();
-        let identity = match file.try_clone().and_then(Handle::from_file) {
+        let identity = match file_identity(&file, &metadata) {
             Ok(identity) => identity,
             Err(error) => {
                 report_file_error(verbose, path, "inspect", &error);
@@ -752,6 +779,27 @@ mod tests {
         fs::write(&file, b"oldnew").unwrap();
         engine.reconcile().unwrap();
         assert_eq!(output(&engine), "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_scan_does_not_retain_a_file_descriptor_per_file() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..128 {
+            fs::write(temp.path().join(format!("file-{index}")), b"old\n").unwrap();
+        }
+        let before = fs::read_dir("/proc/self/fd").unwrap().count();
+        let spec = WatchSpec::from_operand(Some(temp.path().as_os_str())).unwrap();
+        let mut engine = TailEngine::new(spec, OutputMode::Raw, false, Vec::new());
+
+        engine.initialize().unwrap();
+
+        let after = fs::read_dir("/proc/self/fd").unwrap().count();
+        assert!(
+            after <= before + 2,
+            "retained {} file descriptors",
+            after - before
+        );
     }
 
     #[test]
