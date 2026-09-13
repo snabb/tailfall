@@ -781,7 +781,7 @@ mod tests {
         assert_eq!(output(&engine), "new");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn initial_scan_does_not_retain_a_file_descriptor_per_file() {
         let temp = tempfile::tempdir().unwrap();
