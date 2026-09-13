@@ -252,6 +252,7 @@ struct TailEngine<W> {
     output_mode: OutputMode,
     verbose: bool,
     files: BTreeMap<PathBuf, FileState>,
+    startup_paths: BTreeSet<PathBuf>,
     last_output_path: Option<PathBuf>,
     writer: W,
 }
@@ -263,13 +264,16 @@ impl<W: Write> TailEngine<W> {
             output_mode,
             verbose,
             files: BTreeMap::new(),
+            startup_paths: BTreeSet::new(),
             last_output_path: None,
             writer,
         }
     }
 
     fn initialize(&mut self) -> Result<(), Error> {
-        for path in self.spec.matching_paths(self.verbose)? {
+        let paths = self.spec.matching_paths(self.verbose)?;
+        self.startup_paths.extend(paths.iter().cloned());
+        for path in paths {
             if let Some(state) = self.open_at_end(&path)? {
                 self.files.insert(path, state);
             }
@@ -289,6 +293,7 @@ impl<W: Write> TailEngine<W> {
                 &mut self.last_output_path,
                 &path,
                 previous,
+                self.startup_paths.contains(&path),
                 self.verbose,
             )? {
                 self.files.insert(path, state);
@@ -333,6 +338,7 @@ impl<W: Write> TailEngine<W> {
         last_output_path: &mut Option<PathBuf>,
         path: &Path,
         previous: Option<&FileState>,
+        was_present_at_startup: bool,
         verbose: bool,
     ) -> Result<Option<FileState>, Error> {
         let mut file = match OpenOptions::new().read(true).open(path) {
@@ -346,13 +352,14 @@ impl<W: Write> TailEngine<W> {
             }
         };
 
-        let length = match file.metadata() {
-            Ok(metadata) => metadata.len(),
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
             Err(error) => {
                 report_file_error(verbose, path, "inspect", &error);
                 return Ok(None);
             }
         };
+        let length = metadata.len();
         let identity = match file.try_clone().and_then(Handle::from_file) {
             Ok(identity) => identity,
             Err(error) => {
@@ -360,7 +367,14 @@ impl<W: Write> TailEngine<W> {
                 return Ok(None);
             }
         };
-        let mut offset = previous.map_or(0, |state| state.offset);
+        // A path found in the startup inventory may have been temporarily unreadable.  If it
+        // becomes readable later, start at EOF rather than replaying its old contents.
+        let mut offset = previous.map_or_else(
+            || {
+                if was_present_at_startup { length } else { 0 }
+            },
+            |state| state.offset,
+        );
         if previous.is_some_and(|state| state.identity != identity) || length < offset {
             offset = 0;
         }
@@ -589,6 +603,22 @@ mod tests {
         fs::write(temp.path().join("new.log"), b"created\n").unwrap();
         engine.reconcile().unwrap();
         assert_eq!(output(&engine), "created\n");
+    }
+
+    #[test]
+    fn startup_file_that_could_not_be_opened_starts_at_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("existing.log");
+        fs::write(&file, b"old\n").unwrap();
+
+        let pattern = temp.path().join("*.log");
+        let spec = WatchSpec::from_operand(Some(pattern.as_os_str())).unwrap();
+        let mut engine = TailEngine::new(spec, OutputMode::Raw, false, Vec::new());
+        engine.initialize().unwrap();
+        engine.files.remove(&file);
+        engine.reconcile().unwrap();
+
+        assert!(engine.writer.is_empty());
     }
 
     #[test]
